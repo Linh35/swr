@@ -74,8 +74,10 @@ export function bindRenderHost(views: ViewDefinition[], sswPort: MessagePort): B
             const message = err instanceof Error ? err.message : String(err)
             runtime.lastError = message
             runtime.hasRendered = false
-            const msg: WorkerMessage = { type: 'error', viewId: view.id, message }
-            for (const port of runtime.subscribers) port.postMessage(msg)
+            if (runtime.subscribers.size > 0) {
+              const msg: WorkerMessage = { type: 'error', viewId: view.id, message }
+              for (const port of runtime.subscribers) port.postMessage(msg)
+            }
             return
           }
           const html = result.value
@@ -83,8 +85,10 @@ export function bindRenderHost(views: ViewDefinition[], sswPort: MessagePort): B
           if (runtime.hasRendered && html === runtime.lastHtml) return
           runtime.lastHtml = html
           runtime.hasRendered = true
-          const msg: WorkerMessage = { type: 'render', viewId: view.id, html }
-          for (const port of runtime.subscribers) port.postMessage(msg)
+          if (runtime.subscribers.size > 0) {
+            const msg: WorkerMessage = { type: 'render', viewId: view.id, html }
+            for (const port of runtime.subscribers) port.postMessage(msg)
+          }
         })
         runtime.disposeEffect = dispose
       })

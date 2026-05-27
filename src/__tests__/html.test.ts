@@ -69,6 +69,39 @@ describe('html / raw', () => {
   })
 })
 
+describe('html / stress', () => {
+  it('handles a 5000-item flat array', () => {
+    const items = Array.from({ length: 5000 }, (_, i) => html`<li>${i}</li>`)
+    const out = toString(html`<ul>${items}</ul>`)
+    expect(out.startsWith('<ul><li>0</li>')).toBe(true)
+    expect(out.endsWith('<li>4999</li></ul>')).toBe(true)
+    expect((out.match(/<li>/g) ?? []).length).toBe(5000)
+  })
+
+  it('handles a 50KB escapable input without truncation', () => {
+    const unit = '<>&"\''
+    const expanded = '&lt;&gt;&amp;&quot;&#39;'
+    const big = unit.repeat(10_000)
+    const out = toString(html`<p>${big}</p>`)
+    expect(out.length).toBe('<p></p>'.length + expanded.length * 10_000)
+    expect(out.startsWith('<p>' + expanded)).toBe(true)
+    expect(out.endsWith(expanded + '</p>')).toBe(true)
+  })
+
+  it('handles deep nesting without stack overflow', () => {
+    let frag: unknown = 'leaf'
+    for (let i = 0; i < 500; i++) frag = html`<span>${frag}</span>`
+    const out = toString(html`${frag}`)
+    expect((out.match(/<span>/g) ?? []).length).toBe(500)
+    expect(out).toContain('leaf')
+  })
+
+  it('returns the original string when no escapable chars are present', () => {
+    const safe = 'hello world 0123 abc'
+    expect(toString(html`${safe}`)).toBe(safe)
+  })
+})
+
 describe('html / regressions', () => {
   it('does not double-escape the result of a prior html``', () => {
     const a = html`${'&'}`
