@@ -110,6 +110,18 @@ defineView<S>(id: string, store: StoreDefinition<S>, render: (store: Store<S>) =
 - `store`: an ssw store definition. swr subscribes via `useStore`.
 - `render`: runs inside a worker-side `effect()`. Reads every signal it depends on synchronously, like any preact-signals effect.
 
+The render function gets a `ViewContext` as its second argument, which exposes `memo` for keyed fragment caching:
+
+```ts
+defineView('todos', todosStore, (store, { memo }) => html`
+  <ul>${store.items.map((t) =>
+    memo(t.id, [t.text, t.done], () => html`<li>${t.text}</li>`),
+  )}</ul>
+`)
+```
+
+`memo(key, deps, build)` returns a cached `HtmlString` keyed by `key` and invalidated when any `deps` element changes by `===`. Deps should be primitives; objects passing through ssw lose identity across structured clone. Keys not seen during a render are evicted after that render.
+
 ### `defineView(id, stores, render)` (multi-store)
 
 ```ts

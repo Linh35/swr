@@ -788,6 +788,231 @@ describe('swr / lazy effect lifecycle', () => {
   })
 })
 
+describe('swr / ctx.memo', () => {
+  function listStoreDef(id = 'mlist') {
+    return defineStore(id, ({ signal }) => ({
+      items: signal<{ id: number; text: string }[]>([
+        { id: 1, text: 'one' },
+        { id: 2, text: 'two' },
+        { id: 3, text: 'three' },
+      ]),
+    }))
+  }
+
+  it('reuses cached fragment when deps stay equal', async () => {
+    const store = listStoreDef()
+    const builds = new Map<number, number>()
+    const view = defineView('memo-stable', store, (s, { memo }) =>
+      html`<ul>${s.items.map((it) =>
+        memo(it.id, [it.text], () => {
+          builds.set(it.id, (builds.get(it.id) ?? 0) + 1)
+          return html`<li id="i${it.id}">${it.text}</li>`
+        }),
+      )}</ul>`,
+    )
+
+    const sswOnConnect = bindHost([store])
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost([view], sswCh.port1)
+    const tabCh = new MessageChannel()
+    swr.onConnect(tabCh.port2)
+    const tab = rendererFromPort(tabCh.port1)
+    const el = makeContainer()
+    await tab.mount(view, el).ready
+
+    const peerCh = new MessageChannel()
+    sswOnConnect(peerCh.port2)
+    const peer = clientFromPort(peerCh.port1)
+    const peerStore = peer.useStore(store)
+    await peerStore.ready
+    await flush()
+
+    const baseline = new Map(builds)
+    const current = peerStore.items
+    peerStore.items = [...current, { id: 4, text: 'four' }]
+    await flush()
+
+    expect(builds.get(1)).toBe(baseline.get(1))
+    expect(builds.get(2)).toBe(baseline.get(2))
+    expect(builds.get(3)).toBe(baseline.get(3))
+    expect(builds.get(4)).toBe(1)
+    expect(el.innerHTML).toBe(
+      '<ul><li id="i1">one</li><li id="i2">two</li><li id="i3">three</li><li id="i4">four</li></ul>',
+    )
+  })
+
+  it('rebuilds when a dep changes', async () => {
+    const store = listStoreDef()
+    const builds = new Map<number, number>()
+    const view = defineView('memo-update', store, (s, { memo }) =>
+      html`<ul>${s.items.map((it) =>
+        memo(it.id, [it.text], () => {
+          builds.set(it.id, (builds.get(it.id) ?? 0) + 1)
+          return html`<li>${it.text}</li>`
+        }),
+      )}</ul>`,
+    )
+
+    const sswOnConnect = bindHost([store])
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost([view], sswCh.port1)
+    const tabCh = new MessageChannel()
+    swr.onConnect(tabCh.port2)
+    const tab = rendererFromPort(tabCh.port1)
+    const el = makeContainer()
+    await tab.mount(view, el).ready
+
+    const peerCh = new MessageChannel()
+    sswOnConnect(peerCh.port2)
+    const peer = clientFromPort(peerCh.port1)
+    const peerStore = peer.useStore(store)
+    await peerStore.ready
+    await flush()
+    const baseline = new Map(builds)
+
+    peerStore.items = peerStore.items.map((it) =>
+      it.id === 2 ? { ...it, text: 'TWO' } : it,
+    )
+    await flush()
+
+    expect(builds.get(1)).toBe(baseline.get(1))
+    expect(builds.get(2)).toBe(baseline.get(2)! + 1)
+    expect(builds.get(3)).toBe(baseline.get(3))
+    expect(el.innerHTML).toContain('<li>TWO</li>')
+  })
+
+  it('evicts cache entries for keys not used in the most recent render', async () => {
+    const store = listStoreDef()
+    const builds = new Map<number, number>()
+    const view = defineView('memo-evict', store, (s, { memo }) =>
+      html`<ul>${s.items.map((it) =>
+        memo(it.id, [it.text], () => {
+          builds.set(it.id, (builds.get(it.id) ?? 0) + 1)
+          return html`<li>${it.text}</li>`
+        }),
+      )}</ul>`,
+    )
+
+    const sswOnConnect = bindHost([store])
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost([view], sswCh.port1)
+    const tabCh = new MessageChannel()
+    swr.onConnect(tabCh.port2)
+    const tab = rendererFromPort(tabCh.port1)
+    const el = makeContainer()
+    await tab.mount(view, el).ready
+
+    const peerCh = new MessageChannel()
+    sswOnConnect(peerCh.port2)
+    const peer = clientFromPort(peerCh.port1)
+    const peerStore = peer.useStore(store)
+    await peerStore.ready
+    await flush()
+    const baseline = builds.get(2)!
+
+    peerStore.items = peerStore.items.filter((it) => it.id !== 2)
+    await flush()
+    expect(builds.get(2)).toBe(baseline)
+
+    const reintroduced = { id: 2, text: 'TWO' }
+    peerStore.items = [...peerStore.items, reintroduced]
+    await flush()
+    expect(builds.get(2)).toBe(baseline + 1)
+  })
+
+  it('isolates caches across views', async () => {
+    const storeA = listStoreDef('listA')
+    const storeB = listStoreDef('listB')
+    const buildsA = new Map<number, number>()
+    const buildsB = new Map<number, number>()
+    const viewA = defineView('mA', storeA, (s, { memo }) =>
+      html`${s.items.map((it) =>
+        memo(it.id, [it.text], () => {
+          buildsA.set(it.id, (buildsA.get(it.id) ?? 0) + 1)
+          return html`<a>${it.text}</a>`
+        }),
+      )}`,
+    )
+    const viewB = defineView('mB', storeB, (s, { memo }) =>
+      html`${s.items.map((it) =>
+        memo(it.id, [it.text], () => {
+          buildsB.set(it.id, (buildsB.get(it.id) ?? 0) + 1)
+          return html`<b>${it.text}</b>`
+        }),
+      )}`,
+    )
+
+    const sswOnConnect = bindHost([storeA, storeB])
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost([viewA, viewB], sswCh.port1)
+    const tabCh = new MessageChannel()
+    swr.onConnect(tabCh.port2)
+    const tab = rendererFromPort(tabCh.port1)
+    const elA = makeContainer()
+    const elB = makeContainer()
+    await tab.mount(viewA, elA).ready
+    await tab.mount(viewB, elB).ready
+
+    const peerCh = new MessageChannel()
+    sswOnConnect(peerCh.port2)
+    const peer = clientFromPort(peerCh.port1)
+    const a = peer.useStore(storeA)
+    await a.ready
+    await flush()
+    const baselineA = buildsA.get(1)!
+    const baselineB = buildsB.get(1)!
+
+    a.items = a.items.map((it) =>
+      it.id === 1 ? { ...it, text: 'ONE' } : it,
+    )
+    await flush()
+
+    expect(buildsA.get(1)).toBe(baselineA + 1)
+    expect(buildsB.get(1)).toBe(baselineB)
+  })
+
+  it('survives across lazy-effect dormancy cycles', async () => {
+    const store = listStoreDef()
+    const builds = new Map<number, number>()
+    const view = defineView('memo-lazy', store, (s, { memo }) =>
+      html`<ul>${s.items.map((it) =>
+        memo(it.id, [it.text], () => {
+          builds.set(it.id, (builds.get(it.id) ?? 0) + 1)
+          return html`<li>${it.text}</li>`
+        }),
+      )}</ul>`,
+    )
+
+    const sswOnConnect = bindHost([store])
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost([view], sswCh.port1)
+    const tabCh = new MessageChannel()
+    swr.onConnect(tabCh.port2)
+    const tab = rendererFromPort(tabCh.port1)
+
+    const el = makeContainer()
+    const first = tab.mount(view, el)
+    await first.ready
+    await flush()
+    const baseline = new Map(builds)
+    first.unmount()
+    await flush()
+
+    const el2 = makeContainer()
+    const second = tab.mount(view, el2)
+    await second.ready
+
+    expect(builds.get(1)).toBe(baseline.get(1))
+    expect(builds.get(2)).toBe(baseline.get(2))
+    expect(builds.get(3)).toBe(baseline.get(3))
+  })
+})
+
 describe('swr / performance characteristics', () => {
   it('skips innerHTML writes when the rendered HTML did not change', async () => {
     const rig = setupRig()

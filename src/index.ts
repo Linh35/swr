@@ -1,4 +1,9 @@
-export { defineView, type ViewDefinition, type StoreDefinitionLike } from './defineView'
+export {
+  defineView,
+  type ViewDefinition,
+  type ViewContext,
+  type StoreDefinitionLike,
+} from './defineView'
 export { html, raw, toString, HTML, type HtmlString } from './html'
 export {
   createRenderHost,
