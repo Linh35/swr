@@ -1,14 +1,17 @@
 import { clientFromPort, effect } from 'ssw'
-import type { ViewDefinition } from './defineView'
+import type { ViewDefinition, ViewWiring } from './defineView'
 import type { ClientMessage, WorkerMessage } from './protocol'
 
 declare const self: SharedWorkerGlobalScope
 
 interface ViewRuntime {
+  id: string
   subscribers: Set<MessagePort>
+  wiring: ViewWiring
+  isReady: boolean
+  hasRendered: boolean
   lastHtml: string
   lastError: string | null
-  hasRendered: boolean
   disposeEffect: (() => void) | null
 }
 
@@ -49,63 +52,87 @@ export function bindRenderHost(views: ViewDefinition[], sswPort: MessagePort): B
   const portViews = new WeakMap<MessagePort, Set<string>>()
   const portMessageHandlers = new WeakMap<MessagePort, (ev: MessageEvent) => void>()
 
+  function broadcast(runtime: ViewRuntime, msg: WorkerMessage) {
+    for (const port of runtime.subscribers) port.postMessage(msg)
+  }
+
+  function startEffect(runtime: ViewRuntime) {
+    if (runtime.disposeEffect || !runtime.isReady) return
+    // First fire after a (re)start always broadcasts even if the render matches
+    // the cached value, so the subscriber that triggered the start receives it.
+    let isFirstFire = true
+    runtime.disposeEffect = effect(() => {
+      let result
+      try {
+        result = runtime.wiring.render()
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        runtime.lastError = message
+        runtime.hasRendered = false
+        isFirstFire = false
+        if (runtime.subscribers.size > 0) {
+          broadcast(runtime, { type: 'error', viewId: runtime.id, message })
+        }
+        return
+      }
+      const html = result.value
+      runtime.lastError = null
+      const unchanged = runtime.hasRendered && html === runtime.lastHtml
+      runtime.lastHtml = html
+      runtime.hasRendered = true
+      if (unchanged && !isFirstFire) return
+      isFirstFire = false
+      if (runtime.subscribers.size > 0) {
+        broadcast(runtime, { type: 'render', viewId: runtime.id, html })
+      }
+    })
+  }
+
+  function stopEffect(runtime: ViewRuntime) {
+    if (runtime.disposeEffect) {
+      runtime.disposeEffect()
+      runtime.disposeEffect = null
+    }
+  }
+
   for (const view of views) {
     if (runtimes.has(view.id)) {
       throw new Error(`[swr] duplicate view id: ${view.id}`)
     }
     const runtime: ViewRuntime = {
+      id: view.id,
       subscribers: new Set(),
+      wiring: view.init(useStore),
+      isReady: false,
+      hasRendered: false,
       lastHtml: '',
       lastError: null,
-      hasRendered: false,
       disposeEffect: null,
     }
     runtimes.set(view.id, runtime)
 
-    const wiring = view.init(useStore)
-
-    wiring.ready
+    runtime.wiring.ready
       .then(() => {
-        const dispose = effect(() => {
-          let result
-          try {
-            result = wiring.render()
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err)
-            runtime.lastError = message
-            runtime.hasRendered = false
-            if (runtime.subscribers.size > 0) {
-              const msg: WorkerMessage = { type: 'error', viewId: view.id, message }
-              for (const port of runtime.subscribers) port.postMessage(msg)
-            }
-            return
-          }
-          const html = result.value
-          runtime.lastError = null
-          if (runtime.hasRendered && html === runtime.lastHtml) return
-          runtime.lastHtml = html
-          runtime.hasRendered = true
-          if (runtime.subscribers.size > 0) {
-            const msg: WorkerMessage = { type: 'render', viewId: view.id, html }
-            for (const port of runtime.subscribers) port.postMessage(msg)
-          }
-        })
-        runtime.disposeEffect = dispose
+        runtime.isReady = true
+        if (runtime.subscribers.size > 0) startEffect(runtime)
       })
       .catch((err: unknown) => {
         const message = err instanceof Error ? err.message : String(err)
         runtime.lastError = message
-        const msg: WorkerMessage = { type: 'error', viewId: view.id, message }
-        for (const port of runtime.subscribers) port.postMessage(msg)
+        if (runtime.subscribers.size > 0) {
+          broadcast(runtime, { type: 'error', viewId: view.id, message })
+        }
       })
   }
 
   function dropPort(port: MessagePort) {
-    const views = portViews.get(port)
-    if (views) {
-      for (const viewId of views) {
+    const subs = portViews.get(port)
+    if (subs) {
+      for (const viewId of subs) {
         const runtime = runtimes.get(viewId)
-        runtime?.subscribers.delete(port)
+        if (!runtime) continue
+        runtime.subscribers.delete(port)
+        if (runtime.subscribers.size === 0) stopEffect(runtime)
       }
       portViews.delete(port)
     }
@@ -132,6 +159,7 @@ export function bindRenderHost(views: ViewDefinition[], sswPort: MessagePort): B
           } satisfies WorkerMessage)
           return
         }
+        const wasEmpty = runtime.subscribers.size === 0
         runtime.subscribers.add(port)
         ownedViews.add(msg.viewId)
         if (runtime.lastError) {
@@ -140,6 +168,10 @@ export function bindRenderHost(views: ViewDefinition[], sswPort: MessagePort): B
             viewId: msg.viewId,
             message: runtime.lastError,
           } satisfies WorkerMessage)
+          return
+        }
+        if (wasEmpty) {
+          startEffect(runtime)
         } else if (runtime.hasRendered) {
           port.postMessage({
             type: 'render',
@@ -151,7 +183,10 @@ export function bindRenderHost(views: ViewDefinition[], sswPort: MessagePort): B
       }
       if (msg.type === 'unsubscribe') {
         const runtime = runtimes.get(msg.viewId)
-        if (runtime) runtime.subscribers.delete(port)
+        if (runtime) {
+          runtime.subscribers.delete(port)
+          if (runtime.subscribers.size === 0) stopEffect(runtime)
+        }
         ownedViews.delete(msg.viewId)
         return
       }
@@ -168,8 +203,7 @@ export function bindRenderHost(views: ViewDefinition[], sswPort: MessagePort): B
 
   function dispose() {
     for (const runtime of runtimes.values()) {
-      runtime.disposeEffect?.()
-      runtime.disposeEffect = null
+      stopEffect(runtime)
       runtime.subscribers.clear()
     }
   }

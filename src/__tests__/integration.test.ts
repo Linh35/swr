@@ -625,6 +625,169 @@ describe('swr / repeated lifecycle', () => {
   })
 })
 
+describe('swr / lazy effect lifecycle', () => {
+  function spyView() {
+    let renderCount = 0
+    const view = defineView('spy', todosStore, (store) => {
+      renderCount++
+      return html`<p>${store.total}</p>`
+    })
+    return { view, getCount: () => renderCount }
+  }
+
+  it('does not run the render while no tabs are subscribed', async () => {
+    const { view, getCount } = spyView()
+    const sswOnConnect = bindHost([todosStore])
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost([view], sswCh.port1)
+
+    await flush()
+
+    const peerCh = new MessageChannel()
+    sswOnConnect(peerCh.port2)
+    const peer = clientFromPort(peerCh.port1)
+    const peerStore = peer.useStore(todosStore)
+    await peerStore.ready
+
+    peerStore.add('one')
+    peerStore.add('two')
+    await flush()
+
+    expect(getCount()).toBe(0)
+    swr.dispose()
+  })
+
+  it('starts the effect on first subscribe and stops it on last unsubscribe', async () => {
+    const { view, getCount } = spyView()
+    const sswOnConnect = bindHost([todosStore])
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost([view], sswCh.port1)
+
+    const tabCh = new MessageChannel()
+    swr.onConnect(tabCh.port2)
+    const tab = rendererFromPort(tabCh.port1)
+    const el = makeContainer()
+    const handle = tab.mount(view, el)
+    await handle.ready
+    const afterFirstMount = getCount()
+    expect(afterFirstMount).toBeGreaterThan(0)
+
+    const peerCh = new MessageChannel()
+    sswOnConnect(peerCh.port2)
+    const peer = clientFromPort(peerCh.port1)
+    const peerStore = peer.useStore(todosStore)
+    await peerStore.ready
+
+    handle.unmount()
+    await flush()
+
+    peerStore.add('a')
+    peerStore.add('b')
+    await flush()
+
+    expect(getCount()).toBe(afterFirstMount)
+  })
+
+  it('re-runs after re-subscribe and reflects state changed during dormancy', async () => {
+    const { view, getCount } = spyView()
+    const sswOnConnect = bindHost([todosStore])
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost([view], sswCh.port1)
+
+    const tabCh = new MessageChannel()
+    swr.onConnect(tabCh.port2)
+    const tab = rendererFromPort(tabCh.port1)
+    const el = makeContainer()
+    const handle1 = tab.mount(view, el)
+    await handle1.ready
+    expect(el.innerHTML).toBe('<p>0</p>')
+    handle1.unmount()
+    await flush()
+    const dormantCount = getCount()
+
+    const peerCh = new MessageChannel()
+    sswOnConnect(peerCh.port2)
+    const peer = clientFromPort(peerCh.port1)
+    const peerStore = peer.useStore(todosStore)
+    await peerStore.ready
+    peerStore.add('x')
+    peerStore.add('y')
+    peerStore.add('z')
+    await flush()
+    expect(getCount()).toBe(dormantCount)
+
+    const el2 = makeContainer()
+    const handle2 = tab.mount(view, el2)
+    await handle2.ready
+    expect(el2.innerHTML).toBe('<p>3</p>')
+    expect(getCount()).toBe(dormantCount + 1)
+  })
+
+  it('second mount of the same view does not spin up a second effect', async () => {
+    const { view, getCount } = spyView()
+    const sswOnConnect = bindHost([todosStore])
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost([view], sswCh.port1)
+
+    const aCh = new MessageChannel()
+    swr.onConnect(aCh.port2)
+    const tabA = rendererFromPort(aCh.port1)
+    const elA = makeContainer()
+    await tabA.mount(view, elA).ready
+    const afterA = getCount()
+
+    const bCh = new MessageChannel()
+    swr.onConnect(bCh.port2)
+    const tabB = rendererFromPort(bCh.port1)
+    const elB = makeContainer()
+    await tabB.mount(view, elB).ready
+    expect(getCount()).toBe(afterA)
+    expect(elB.innerHTML).toBe(elA.innerHTML)
+
+    const peerCh = new MessageChannel()
+    sswOnConnect(peerCh.port2)
+    const peer = clientFromPort(peerCh.port1)
+    const peerStore = peer.useStore(todosStore)
+    await peerStore.ready
+    peerStore.add('shared')
+    await flush()
+    expect(getCount()).toBe(afterA + 1)
+    expect(elA.innerHTML).toBe(elB.innerHTML)
+  })
+
+  it('leave message stops the effect when it was the only subscriber', async () => {
+    const { view, getCount } = spyView()
+    const sswOnConnect = bindHost([todosStore])
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost([view], sswCh.port1)
+
+    const tabCh = new MessageChannel()
+    swr.onConnect(tabCh.port2)
+    const tab = rendererFromPort(tabCh.port1)
+    const el = makeContainer()
+    await tab.mount(view, el).ready
+    const afterMount = getCount()
+
+    tab.dispose()
+    await flush()
+
+    const peerCh = new MessageChannel()
+    sswOnConnect(peerCh.port2)
+    const peer = clientFromPort(peerCh.port1)
+    const peerStore = peer.useStore(todosStore)
+    await peerStore.ready
+    peerStore.add('after-leave')
+    await flush()
+
+    expect(getCount()).toBe(afterMount)
+  })
+})
+
 describe('swr / performance characteristics', () => {
   it('skips innerHTML writes when the rendered HTML did not change', async () => {
     const rig = setupRig()
