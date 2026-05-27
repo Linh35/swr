@@ -1013,6 +1013,241 @@ describe('swr / ctx.memo', () => {
   })
 })
 
+describe('swr / races', () => {
+  it('renderer.dispose mid-flight: subsequent worker messages are ignored', async () => {
+    const rig = setupRig()
+    const tab = rig.bridgeNewTab()
+    const el = makeContainer()
+    await tab.mount(todosView, el).ready
+    const before = el.innerHTML
+
+    const ws = rig.bridgeNewClient().useStore(todosStore)
+    await ws.ready
+
+    tab.dispose()
+    ws.add('after-dispose-1')
+    ws.add('after-dispose-2')
+    await flush()
+    expect(el.innerHTML).toBe(before)
+  })
+
+  it('host.dispose while a mount is awaiting first render does not crash the client', async () => {
+    const sswOnConnect = bindHost([todosStore])
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost([todosView], sswCh.port1)
+
+    const tabCh = new MessageChannel()
+    swr.onConnect(tabCh.port2)
+    const renderer = rendererFromPort(tabCh.port1)
+    const el = makeContainer()
+    const handle = renderer.mount(todosView, el)
+
+    swr.dispose()
+
+    const settled = await Promise.race([
+      handle.ready.then(() => 'ok' as const, () => 'rejected' as const),
+      new Promise<'pending'>((r) => setTimeout(() => r('pending'), 20)),
+    ])
+    expect(settled === 'ok' || settled === 'pending').toBe(true)
+  })
+
+  it('rapid subscribe/unsubscribe storm leaves consistent state', async () => {
+    const rig = setupRig()
+    const tab = rig.bridgeNewTab()
+    const ws = rig.bridgeNewClient().useStore(todosStore)
+    await ws.ready
+
+    for (let i = 0; i < 50; i++) {
+      const el = makeContainer()
+      const h = tab.mount(todosView, el)
+      if (i % 3 === 0) await h.ready
+      h.unmount()
+    }
+
+    const final = makeContainer()
+    await tab.mount(todosView, final).ready
+    ws.add('end')
+    await flush()
+    expect(final.innerHTML).toContain('end')
+  })
+
+  it('mount().ready settles exactly once across many subsequent renders', async () => {
+    const rig = setupRig()
+    const tab = rig.bridgeNewTab()
+    const el = makeContainer()
+    const handle = tab.mount(todosView, el)
+
+    let resolveCount = 0
+    handle.ready.then(() => {
+      resolveCount++
+    })
+    await flush()
+
+    const ws = rig.bridgeNewClient().useStore(todosStore)
+    await ws.ready
+    for (let i = 0; i < 20; i++) ws.add(`row-${i}`)
+    await flush()
+
+    expect(resolveCount).toBe(1)
+  })
+
+  it('repeated subscribe from the same port is idempotent', async () => {
+    const sswOnConnect = bindHost([todosStore])
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost([todosView], sswCh.port1)
+    const tabCh = new MessageChannel()
+    swr.onConnect(tabCh.port2)
+    const tab = rendererFromPort(tabCh.port1)
+
+    const el = makeContainer()
+    const h1 = tab.mount(todosView, el)
+    await h1.ready
+    const h2 = tab.mount(todosView, el)
+    await h2.ready
+    const h3 = tab.mount(todosView, el)
+    await h3.ready
+
+    const ws = (() => {
+      const ch = new MessageChannel()
+      sswOnConnect(ch.port2)
+      return clientFromPort(ch.port1).useStore(todosStore)
+    })()
+    await ws.ready
+    ws.add('once')
+    await flush()
+    const occurrences = el.innerHTML.match(/once/g)?.length ?? 0
+    expect(occurrences).toBe(1)
+  })
+})
+
+describe('swr / multi-writer convergence', () => {
+  it('five concurrent writers each adding one item all converge in the rendered HTML', async () => {
+    const rig = setupRig()
+    const tab = rig.bridgeNewTab()
+    const el = makeContainer()
+    await tab.mount(todosView, el).ready
+
+    const writers = await Promise.all(
+      Array.from({ length: 5 }, async () => {
+        const ws = rig.bridgeNewClient().useStore(todosStore)
+        await ws.ready
+        return ws
+      }),
+    )
+
+    writers.forEach((w, i) => w.add(`w${i}`))
+    await flush(8)
+
+    for (let i = 0; i < 5; i++) expect(el.innerHTML).toContain(`w${i}`)
+    expect(el.innerHTML).toContain('<h2>5/5</h2>')
+  })
+
+  it('interleaved add + toggle from different writers preserves both ops', async () => {
+    const rig = setupRig()
+    const tab = rig.bridgeNewTab()
+    const el = makeContainer()
+    await tab.mount(todosView, el).ready
+
+    const writerA = rig.bridgeNewClient().useStore(todosStore)
+    const writerB = rig.bridgeNewClient().useStore(todosStore)
+    await Promise.all([writerA.ready, writerB.ready])
+
+    writerA.add('alpha')
+    writerB.add('beta')
+    writerA.add('gamma')
+    await flush()
+
+    const idAlpha = 1
+    writerB.toggle(idAlpha)
+    await flush()
+
+    expect(el.innerHTML).toContain('alpha')
+    expect(el.innerHTML).toContain('beta')
+    expect(el.innerHTML).toContain('gamma')
+    expect(el.innerHTML).toMatch(/<li id="t1" class="done"/)
+  })
+})
+
+describe('swr / scale', () => {
+  it('renders to many subscribers in a single broadcast pass', async () => {
+    const rig = setupRig()
+    const N = 25
+    const els: Element[] = []
+    for (let i = 0; i < N; i++) {
+      const tab = rig.bridgeNewTab()
+      const el = makeContainer()
+      els.push(el)
+      tab.mount(todosView, el)
+    }
+    await flush()
+
+    const ws = rig.bridgeNewClient().useStore(todosStore)
+    await ws.ready
+    ws.add('broadcast')
+    await flush()
+
+    for (const el of els) expect(el.innerHTML).toContain('broadcast')
+    const first = els[0]!.innerHTML
+    for (const el of els) expect(el.innerHTML).toBe(first)
+  })
+
+  it('handles 50 views on a single render host', async () => {
+    const stores = Array.from({ length: 50 }, (_, i) =>
+      defineStore(`scale-${i}`, ({ signal }) => ({ n: signal(i) })),
+    )
+    const views = stores.map((s) =>
+      defineView(`v-${s.id}`, s, (store) => html`<p>${s.id}=${store.n}</p>`),
+    )
+
+    const sswOnConnect = bindHost(stores)
+    const sswCh = new MessageChannel()
+    sswOnConnect(sswCh.port2)
+    const swr = bindRenderHost(views, sswCh.port1)
+    const tabCh = new MessageChannel()
+    swr.onConnect(tabCh.port2)
+    const tab = rendererFromPort(tabCh.port1)
+
+    const handles = views.map((v) => {
+      const el = makeContainer()
+      return { el, handle: tab.mount(v, el) }
+    })
+    await Promise.all(handles.map((h) => h.handle.ready))
+
+    for (let i = 0; i < handles.length; i++) {
+      expect(handles[i]!.el.innerHTML).toBe(`<p>scale-${i}=${i}</p>`)
+    }
+  })
+})
+
+describe('swr / two renderers on one worker', () => {
+  it('keeps tab-side state independent across renderers backed by the same host', async () => {
+    const rig = setupRig()
+    const tabA = rig.bridgeNewTab()
+    const tabB = rig.bridgeNewTab()
+    const elA = makeContainer()
+    const elB = makeContainer()
+    const handleA = tabA.mount(todosView, elA)
+    const handleB = tabB.mount(todosView, elB)
+    await handleA.ready
+    await handleB.ready
+
+    const ws = rig.bridgeNewClient().useStore(todosStore)
+    await ws.ready
+    ws.add('shared-via-host')
+    await flush()
+    expect(elA.innerHTML).toContain('shared-via-host')
+    expect(elB.innerHTML).toContain('shared-via-host')
+
+    tabA.dispose()
+    ws.add('after-A-dispose')
+    await flush()
+    expect(elA.innerHTML).not.toContain('after-A-dispose')
+    expect(elB.innerHTML).toContain('after-A-dispose')
+  })
+})
+
 describe('swr / performance characteristics', () => {
   it('skips innerHTML writes when the rendered HTML did not change', async () => {
     const rig = setupRig()
